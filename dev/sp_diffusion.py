@@ -4,8 +4,10 @@
 
 """
 
+from diffusers import DDIMScheduler
 from diffusers import DDPMScheduler, UNet2DModel
 import torch
+import math
 import numpy as np
 import torch as th
 from PIL import Image
@@ -14,9 +16,13 @@ from pathlib import Path
 import glob,os
 from einops import rearrange,repeat
 from easydict import EasyDict as edict
+import torchvision.utils as tv_utils
+# from torchvision.utils import make_grid
+# torchvision.utils.save_image
 
 def inference(model,scheduler,state,sp_model,tgt_sims,use_sp_guidance):
 
+    eta = 1.
     info = edict()
     fields = ["sims_delta"]
     for k in fields: info[k] = []
@@ -25,32 +31,57 @@ def inference(model,scheduler,state,sp_model,tgt_sims,use_sp_guidance):
         with torch.no_grad():
 
             # -- compute score --
-            noisy_res = model(state, t).sample
+            score = model(state, t).sample
             # print("noisy_res.abs().mean(): ",noisy_res.abs().mean())
 
         # -- unpack --
-        sched_dict = scheduler.step(noisy_res, t, state)
-        next_state = sched_dict.prev_sample
+        sched_dict = scheduler.step(score, t, state, eta=eta)
+        # next_state = sched_dict.prev_sample
         deno = sched_dict.pred_original_sample
 
         # -- add guidance --
-        alpha,beta = get_scales(scheduler,t)
-        sp_grad,sims_delta = superpixel_guidance(deno,sp_model,tgt_sims,alpha,beta)
+        sp_scale = get_ddim_scale(scheduler,t,eta)
         if use_sp_guidance:
-            # alpha,beta = get_scales(scheduler,t)
-            # sp_grad,sims_delta = superpixel_guidance(deno,sp_model,tgt_sims,alpha,beta)
-            next_state = next_state + sp_grad
-        # else:
-        #     alpha,beta = get_scales(scheduler,t)
-        #     sp_grad,sims_delta = superpixel_guidance(deno,sp_model,tgt_sims,alpha,beta)
+            sp_grad,sims_delta = superpixel_guidance(deno,sp_model,tgt_sims)
+            # next_state = next_state + sp_scale * sp_grad
+        else:
+            sp_scale = get_ddim_scale(scheduler,t,eta)
+            sp_grad,sims_delta = superpixel_guidance(deno,sp_model,tgt_sims)
+            sp_grad[...] = 0.
+            # sims_delta = th.zeros((len(deno)),device=deno.device).tolist()
 
-        # -- update --
-        state = next_state
+        #-- udate --
+        # print(sp_scale)
+        score = score - sp_scale * sp_grad
+        sched_dict = scheduler.step(score, t, state, eta=eta)
+        state = sched_dict.prev_sample # next_state -> state
 
         # -- update info --
         info.sims_delta.append(sims_delta)
 
     return state,info
+
+def get_ddim_scale(scheduler,timestep, eta=0.):
+
+    # 1. get previous step value (=t-1)
+    sched = scheduler
+    div_tmp = sched.config.num_train_timesteps // sched.num_inference_steps
+    prev_timestep = timestep - div_tmp
+
+    # -- alpha prod --
+    alpha_prod_t = sched.alphas_cumprod[timestep]
+    if prev_timestep >= 0:
+        alpha_prod_t_prev = sched.alphas_cumprod[prev_timestep]
+    else:
+        alpha_prod_t_prev = sched.final_alpha_cumprod
+
+    # -- std dev --
+    variance = sched._get_variance(timestep, prev_timestep)
+    std_dev_t = eta * variance ** (0.5)
+
+    # sp_scale = (1 - alpha_prod_t_prev - std_dev_t**2) ** (0.5)
+    sp_scale = math.sqrt(1-alpha_prod_t)
+    return sp_scale
 
 def get_scales(scheduler,t):
     prev_t = scheduler.previous_timestep(t)
@@ -64,13 +95,63 @@ def get_scales(scheduler,t):
     # (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
     return alpha_prod_t ** (0.5),beta_prod_t ** (0.5)
 
-def superpixel_guidance(deno,sp_model,tgt_sims,alpha,beta):
-    deno = (deno + 1)/2.
-    sims,_,_,ftrs = sp_model(deno)
-    scale = sp_model.affinity_softmax
+def superpixel_guidance(deno,sp_model,tgt_sims):
+
+    # -- compute superpixels --
+    # _deno = deno.mean(-3,keepdim=True)
+    # sims,_,_,ftrs = sp_model(_deno)
+
+    # -- from Eq --
+    # def sim_fxn(deno):
+    #     deno = (deno + 1)/2.
+    #     deno = deno.mean(-3,keepdim=True)
+    #     sims,_,_,ftrs = sp_model(deno)
+    #     # -- compute grad --
+    #     mask = sims!=0
+    #     eps = 1e-15
+    #     Dkl = th.sum(tgt_sims*th.log(sims+eps)*mask,dim=(-2,-1))
+    #     # sp_grad = torch.autograd.grad(Dkl,deno)[0]
+    #     return Dkl
+    # sp_grad = -torch.autograd.functional.jacobian(sim_fxn, deno)[0]
+
+    # -- v2 [wrong quantity] --
+    # deno = deno.requires_grad_(True)
+    # deno = (deno + 1)/2.
+    # deno = deno.mean(-3,keepdim=True)
+    # sims,_,_,ftrs = sp_model(deno)
+    # mask = sims!=0
+    # eps = 1e-15
+    # Dkl = th.sum(tgt_sims*th.log(sims+eps)*mask)
+    # sp_grad_v2 = torch.autograd.grad(Dkl,deno)[0]
+    # print(sp_grad_v2.abs())
+
+    # -- info --
+    # print("delta: ",th.mean((sp_grad-sp_grad_v2).abs()))
+
+
+    # # print(sp_grad.abs())
+    # # print(sp_grad.abs().mean(),sp_grad.abs().std())
+    # # print(sp_grad_v2.abs().mean(),sp_grad_v2.abs().std())
+    # # exit()
+    # rescale = 1
+    # return rescale*sp_grad/alpha,sims_delta
+
+    # -- compute grad --
+    # print(deno.min(),deno.max())
     deno = deno.requires_grad_(True)
-    dists = get_dists(deno,ftrs,sp_model.stoken_size[0],sp_model.M)
+    _deno = (deno + 1)/2.
+    _deno = _deno.mean(-3,keepdim=True)
+    sims,_,_,ftrs = sp_model(_deno)
+    ftrs = ftrs.detach()
+    scale = sp_model.affinity_softmax
+    # deno = deno.requires_grad_(True)
+    dists = get_dists(_deno,ftrs,sp_model.stoken_size[0],sp_model.M)
+    # print(dists.abs().mean(),dists.abs().std())
     dists = dists.reshape_as(sims)
+    dists = th.sum((tgt_sims - sims) * dists, dim=(-1,-2))
+    th.autograd.backward(dists,th.ones_like(dists),inputs=deno)
+    Ddists = deno.grad
+    # print("Ddists.shape: ",Ddists.shape)
     # delta_sims = tgt_sims - sims
     # print("-"*10)
     # print(tgt_sims[0,15,15,:4,:4])
@@ -84,15 +165,23 @@ def superpixel_guidance(deno,sp_model,tgt_sims,alpha,beta):
     sims_delta = ((tgt_sims - sims)*mask).flatten(1).abs().sum(-1)
     sims_delta = sims_delta / mask.flatten(1).sum(-1)
     sims_delta = sims_delta.tolist()
-    # print(sims_delta)
-    # exit()
+    # # print(sims_delta)
+    # # exit()
 
     # -- grad --
-    Dkl = th.mean(th.sum((tgt_sims - sims) * dists,dim=(-1,-2)))
-    sp_grad = -torch.autograd.grad(Dkl,deno)[0]
-    return 30*(scale*sp_grad)/alpha,sims_delta
+    # Dkl = th.mean(th.sum((tgt_sims - sims) * Ddists,dim=(-1,-2)))
+    # sp_grad = -torch.autograd.grad(Dkl,deno)[0]
+    # sp_grad = th.sum((tgt_sims - sims) * Ddists,dim=(-1,-2))
 
-def save_image(name,input,proc=True):
+    sp_grad = Ddists
+    # scale = 1.
+    # rescale = 0.005 #beta/alpha
+    # return rescale*(scale*sp_grad/alpha),sims_delta
+    # sp_grad = (beta/alpha)*sp_grad
+    # print(beta,alpha,sp_grad.abs().mean(),sp_grad.abs().std(),sp_grad.min(),sp_grad.max())
+    return sp_grad,sims_delta
+
+def save_image(name,input,proc=True,with_grid=True):
     # -- create output dir --
     if not Path(name).exists():
         Path(name).mkdir(parents=True)
@@ -106,6 +195,11 @@ def save_image(name,input,proc=True):
         image = (image.permute(1, 2, 0) * 255).round().to(torch.uint8).cpu().numpy()
         image = Image.fromarray(image)
         image.save("%s/%05d.png" % (name,b))
+
+    # -- save a grid --
+    if with_grid:
+        grid = tv_utils.make_grid(input)[None,:]
+        tv_utils.save_image(grid,Path(name)/"grid.png")
 
 def load_sp_model():
 
@@ -146,9 +240,10 @@ def load_sp_model():
 
     return model
 
-def load_sp_model_v0():
+def load_sp_model_v0(stride,scale,M):
     from superpixel_paper.models.sp_modules import GenSP
-    model = GenSP(n_iter=5,M=1e-5,stoken_size=12,affinity_softmax=10.,
+    model = GenSP(n_iter=5,M=M,stoken_size=stride,
+                  affinity_softmax=scale,use_grad=True,
                   gen_sp_type="reshape",return_ftrs=True)
     return model
 
@@ -187,7 +282,27 @@ def get_dists(img,ftrs,stride,M):
 
     return dists
 
-def get_tgt_sp_celeb(sp_model,H,W):
+def get_tgt_sp_celeb(sp_model,B,H,W):
+    assert (H==W) and (H==256), "Must be 256."
+    root = Path("/home/gauenk/Documents/data/celebhqa_256/images/")
+    fns = [fn for fn in root.iterdir() if fn.suffix == ".jpg"]
+    idx_list = np.random.permutation(len(fns))[:B]
+    imgs,sims = [],[]
+    for idx in idx_list:
+        img_fn = fns[idx]
+        img = Image.open(img_fn).convert("RGB")
+        img = th.from_numpy(np.array(img))/255.
+        img = rearrange(img,'h w c -> 1 c h w').cuda()
+
+        _img = img.mean(-3,keepdim=True)
+        _sims,_,_,_ftrs = sp_model(_img)
+        imgs.append(img)
+        sims.append(_sims)
+    imgs = th.cat(imgs)
+    sims = th.cat(sims)
+    return imgs, sims
+
+def get_tgt_sp_celeb_woman(sp_model,H,W):
     img_fn = "diff_output/sample/woman.jpg"
     img = Image.open(img_fn).convert("RGB")
     img = th.from_numpy(np.array(img))/255.
@@ -198,9 +313,26 @@ def get_tgt_sp_celeb(sp_model,H,W):
     # img = transform(img)
     img = img[...,48:2*H+48:2,76:2*W+76:2]
 
-    sims,_,_,ftrs = sp_model(img)
+    _img = img.mean(-3,keepdim=True)
+    sims,_,_,ftrs = sp_model(_img)
     return img, sims
 
+def get_tgt_sp_cifar(sp_model,B,H,W):
+    root = Path("/home/gauenk/Documents/data/cifar-10/images/")
+    fns = [fn for fn in root.iterdir() if fn.suffix == ".png"]
+    idx_list = np.random.permutation(len(fns))[:B]
+    imgs,sims = [],[]
+    for idx in idx_list:
+        img = Image.open(fns[idx]).convert("RGB")
+        img = th.from_numpy(np.array(img))/255.
+        img = rearrange(img,'h w c -> 1 c h w').cuda()
+        _img = img.mean(-3,keepdim=True)
+        _sims,_,_,ftrs = sp_model(_img)
+        imgs.append(img)
+        sims.append(_sims)
+    imgs = th.cat(imgs)
+    sims = th.cat(sims)
+    return imgs, sims
 
 def get_tgt_sp(sp_model,H,W):
     root = Path("data/sr/BSD500/images/all/")
@@ -220,15 +352,25 @@ def get_tgt_sp(sp_model,H,W):
     sims,_,_,ftrs = sp_model(img)
     return img, sims
 
-def run_exp(B,nsteps,use_sp_guidance,seed,ddpm_name):
+def get_tgt_sp(ddpm_name,sp_model,B,H,W):
+    if "celeb" in ddpm_name:
+        return get_tgt_sp_celeb(sp_model,B,H,W)
+    elif "cifar10" in ddpm_name:
+        return get_tgt_sp_cifar(sp_model,B,H,W)
+    else:
+        return get_tgt_sp_rand(sp_model,H,W)
+
+def run_exp(exp_name,B,nsteps,use_sp_guidance,seed,ddpm_name,
+            stride,scale,M):
 
     # -- init seed --
     np.random.seed(seed)
     torch.manual_seed(seed)
 
     # -- init models --
-    scheduler = DDPMScheduler.from_pretrained(ddpm_name)
-    sp_model = load_sp_model_v0()
+    scheduler = DDIMScheduler.from_pretrained(ddpm_name)
+    # scheduler = DDPMScheduler.from_pretrained(ddpm_name)
+    sp_model = load_sp_model_v0(stride,scale,M)
     model = UNet2DModel.from_pretrained(ddpm_name).to("cuda")
     scheduler.set_timesteps(nsteps)
 
@@ -239,42 +381,61 @@ def run_exp(B,nsteps,use_sp_guidance,seed,ddpm_name):
 
     # -- sample superpixel --
     H,W = sample_size,sample_size
-    sp_img,tgt_sims = get_tgt_sp_celeb(sp_model,H,W)
+    sp_img,tgt_sims = get_tgt_sp(ddpm_name,sp_model,B,H,W)
     # sp_img, tgt_sims = get_tgt_sp(sp_model,H,W)
+    # print(sp_img.shape)
+    # exit()
     save_image("sp_img",sp_img,False)
     # exit()
-    tgt_sims = repeat(tgt_sims,'1 h w sh sw -> b h w sh sw',b=B)
+    if tgt_sims.shape[0] == 1:
+        tgt_sims = repeat(tgt_sims,'1 h w sh sw -> b h w sh sw',b=B)
 
     # -- inference --
     sample,info = inference(model,scheduler,noise,sp_model,tgt_sims,use_sp_guidance)
     format_info(info)
-    save_root = Path("diff_output") / ddpm_name.split("/")[-1]
-    if use_sp_guidance:
-        save_image(save_root/"cond",sample)
-    else:
-        save_image(save_root/"standard",sample)
+    save_root = Path("diff_output") / ddpm_name.split("/")[-1] / exp_name
+    save_root_i = save_root / "images"
+    if not save_root_i.exists(): save_root_i.mkdir(parents=True)
+    print(save_root_i)
+    save_image(save_root_i,sample,with_grid=False)
+
+    # -- save grid --
+    save_root_g = save_root/"grid"
+    if not save_root_g.exists(): save_root_g.mkdir(parents=True)
+    grid = (tv_utils.make_grid(sample)[None,:] + 1)/2.
+    tv_utils.save_image(grid,save_root_g/"grid.png")
 
 def format_info(info):
     np.set_printoptions(precision=3)
     # -- format sims delta --
     nsteps = len(info.sims_delta)
     delta = np.array([info.sims_delta[t] for t in [0,nsteps-1]])
-    delta = np.exp(-delta)
+    delta = np.exp(-10*delta)
     print(delta)
 
 def main():
 
     # -- optional --
-    B = 20
-    nsteps = 50
-    seed = 123
+    B = 200
+    # B = 16
+    # nsteps = 5000
+    # nsteps = 1000
+    nsteps = 100
+    seed = 456
     # ddpm_name = "google/ddpm-cat-256"
-    ddpm_name = "google/ddpm-celebahq-256"
-    run_exp(B,nsteps,True,seed,ddpm_name)
-    # run_exp(B,nsteps,False,seed,ddpm_name)
-    # run_exp(seed,False)
-    # for sp_guidance in [True,False]:
-    #     run_exp(sp_guidance)
+    # ddpm_name = "google/ddpm-celebahq-256"
+    ddpm_name = "google/ddpm-cifar10-32"
+    stride = 1
+    scale = 1
+    M = 0#1e-8
+    # run_exp("cond_dev",B,nsteps,True,seed,ddpm_name,stride,scale,M)
+    run_exp("cond_dev2",B,nsteps,True,seed,ddpm_name,stride,scale,M)
+    # run_exp("cond_dev3",B,nsteps,True,seed,ddpm_name,stride,scale,M)
+
+    # run_exp("cond_dev4",B,nsteps,True,seed,ddpm_name,stride,scale,M)
+    # run_exp("standard_dev",B,nsteps,False,seed,ddpm_name,stride,scale,M)
+
+    # run_exp("standard_dev2",B,nsteps,False,seed,ddpm_name,stride,scale,M)
 
 if __name__ == "__main__":
     main()
