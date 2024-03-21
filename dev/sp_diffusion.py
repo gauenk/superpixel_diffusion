@@ -6,7 +6,9 @@
 
 from diffusers import DDIMScheduler
 from diffusers import DDPMScheduler, UNet2DModel
+import os
 import torch
+import random
 import math
 import numpy as np
 import torch as th
@@ -17,10 +19,11 @@ import glob,os
 from einops import rearrange,repeat
 from easydict import EasyDict as edict
 import torchvision.utils as tv_utils
+# torch.use_deterministic_algorithms(True)
 # from torchvision.utils import make_grid
 # torchvision.utils.save_image
 
-def inference(model,scheduler,state,sp_model,tgt_sims,use_sp_guidance):
+def inference(model,scheduler,state,sp_model,tgt_sims,use_sp_guidance,rescale):
 
     eta = 1.
     info = edict()
@@ -51,8 +54,7 @@ def inference(model,scheduler,state,sp_model,tgt_sims,use_sp_guidance):
             # sims_delta = th.zeros((len(deno)),device=deno.device).tolist()
 
         #-- udate --
-        # print(sp_scale)
-        score = score - sp_scale * sp_grad
+        score = score + rescale * sp_scale * sp_grad
         sched_dict = scheduler.step(score, t, state, eta=eta)
         state = sched_dict.prev_sample # next_state -> state
 
@@ -360,12 +362,16 @@ def get_tgt_sp(ddpm_name,sp_model,B,H,W):
     else:
         return get_tgt_sp_rand(sp_model,H,W)
 
-def run_exp(exp_name,B,nsteps,use_sp_guidance,seed,ddpm_name,
-            stride,scale,M):
+def run_exp(exp_name,seed,B,nsteps,use_sp_guidance,
+            ddpm_name,stride,scale,M,rescale):
 
     # -- init seed --
+    os.environ['PYTHONHASHSEED']=str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
 
     # -- init models --
     scheduler = DDIMScheduler.from_pretrained(ddpm_name)
@@ -391,7 +397,8 @@ def run_exp(exp_name,B,nsteps,use_sp_guidance,seed,ddpm_name,
         tgt_sims = repeat(tgt_sims,'1 h w sh sw -> b h w sh sw',b=B)
 
     # -- inference --
-    sample,info = inference(model,scheduler,noise,sp_model,tgt_sims,use_sp_guidance)
+    sample,info = inference(model,scheduler,noise,sp_model,tgt_sims,
+                            use_sp_guidance,rescale)
     format_info(info)
     save_root = Path("diff_output") / ddpm_name.split("/")[-1] / exp_name
     save_root_i = save_root / "images"
@@ -413,29 +420,41 @@ def format_info(info):
     delta = np.exp(-10*delta)
     print(delta)
 
+def run_batched_exp(name,num,seed,*args):
+    for i in range(num):
+        name_i = name + "_%02d" % i
+        run_exp(name_i,seed+i,*args)
+
 def main():
 
     # -- optional --
-    B = 200
-    # B = 16
+    # B = 200
+    B = 16
     # nsteps = 5000
     # nsteps = 1000
     nsteps = 100
     seed = 456
     # ddpm_name = "google/ddpm-cat-256"
-    # ddpm_name = "google/ddpm-celebahq-256"
-    ddpm_name = "google/ddpm-cifar10-32"
-    stride = 1
-    scale = 1
-    M = 0#1e-8
-    # run_exp("cond_dev",B,nsteps,True,seed,ddpm_name,stride,scale,M)
-    run_exp("cond_dev2",B,nsteps,True,seed,ddpm_name,stride,scale,M)
-    # run_exp("cond_dev3",B,nsteps,True,seed,ddpm_name,stride,scale,M)
+    ddpm_name = "google/ddpm-celebahq-256"
+    # ddpm_name = "google/ddpm-cifar10-32"
+    stride = 16
+    scale = 2
+    M = 1e-8
+    rescale = 1.
+    N = 1e4//B
 
-    # run_exp("cond_dev4",B,nsteps,True,seed,ddpm_name,stride,scale,M)
-    # run_exp("standard_dev",B,nsteps,False,seed,ddpm_name,stride,scale,M)
+    # run_exp("cond_dev",seed,B,nsteps,True,ddpm_name,stride,scale,M,rescale)
+    # run_exp("cond_dev2",seed,B,nsteps,True,ddpm_name,stride,scale,M,rescale)
+    # run_exp("cond_dev3",seed,B,nsteps,True,ddpm_name,stride,scale,M,rescale)
+    # run_exp("cond_dev",seed,B,nsteps,True,ddpm_name,stride,scale,M,rescale)
 
-    # run_exp("standard_dev2",B,nsteps,False,seed,ddpm_name,stride,scale,M)
+    print("num: ",N)
+    run_batched_exp("cond_dev",N,seed,B,nsteps,True,ddpm_name,stride,scale,M,rescale)
+    # run_batched_exp("stand_dev",N,seed,B,nsteps,False,ddpm_name,stride,scale,M,rescale)
+
+    # run_exp("stand_dev",seed,B,nsteps,False,ddpm_name,stride,scale,M,rescale)
+    # run_exp("stand_dev2",seed,B,nsteps,False,ddpm_name,stride,scale,M,rescale)
+    # run_exp("stand_dev3",seed,B,nsteps,False,ddpm_name,stride,scale,M,rescale)
 
 if __name__ == "__main__":
     main()
