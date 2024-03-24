@@ -620,6 +620,7 @@ def main(args):
                                                          tgt_sims,tgt_ftrs,use_ftrs)
                 # print(sp_grad.abs().mean(),sp_grad.abs().min(),sp_grad.abs().max())
                 # exit()
+                # -- I think the training term needs to change. --
 
                 # print(model_output.shape,sp_grad.shape,sp_scale.shape)
                 model_output = model_output + sp_scale * sp_grad
