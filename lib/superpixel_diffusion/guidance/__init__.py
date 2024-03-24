@@ -13,18 +13,19 @@ from easydict import EasyDict as edict
 import torchvision.utils as tv_utils
 from superpixel_paper.models.sp_modules import dists_to_sims,get_dists,expand_dists
 
-def superpixel_guidance(state,sp_model,tgt_sims,tgt_ftrs,use_ftrs):
+def superpixel_guidance(state,sp_model,tgt_sims,tgt_ftrs,use_ftrs,use_for_grad=None):
     if use_ftrs:
-        return superpixel_guidance_ftrs(state,sp_model,tgt_sims,tgt_ftrs)
+        return superpixel_guidance_ftrs(state,sp_model,tgt_sims,tgt_ftrs,use_for_grad)
     else:
-        return superpixel_guidance_slic(state,sp_model,tgt_sims)
+        return superpixel_guidance_slic(state,sp_model,tgt_sims,use_for_grad)
 
-def superpixel_guidance_ftrs(state,sp_model,tgt_sims,tgt_ftrs):
+def superpixel_guidance_ftrs(state,sp_model,tgt_sims,tgt_ftrs,use_for_grad=None):
 
     # -- compute current sims --
     H,W = state.shape[-2:]
-    state = state.requires_grad_(True)
+    state = state.clone().requires_grad_(True)
     # _state = (state + 1)/2.
+    # _state = _state.mean(-3,keepdim=True)
     scale = sp_model.affinity_softmax
     stride = sp_model.stoken_size[0]
     dists = get_dists(state,tgt_ftrs,stride,sp_model.M)
@@ -42,10 +43,10 @@ def superpixel_guidance_ftrs(state,sp_model,tgt_sims,tgt_ftrs):
 
     # -- compute expectation --
     eps = 1e-15
-    expectation = th.sum((tgt_sims * th.log(sims+eps))*(tgt_sims>0),dim=(-2,-1))
-    th.autograd.backward(expectation,th.ones_like(expectation),inputs=state)
-    Ddists = state.grad
-    sp_grad = Ddists
+    expectation = th.sum((tgt_sims * th.log(sims+eps)),dim=(-2,-1))
+    if use_for_grad is None: use_for_grad = state
+    th.autograd.backward(expectation,th.ones_like(expectation),inputs=use_for_grad)
+    sp_grad = use_for_grad.grad
 
     # -- info --
     mask = sims!=0
@@ -55,109 +56,37 @@ def superpixel_guidance_ftrs(state,sp_model,tgt_sims,tgt_ftrs):
 
     return sp_grad,sims_delta
 
-def superpixel_guidance_slic(state,sp_model,tgt_sims):
-
-    # -- compute superpixels --
-    # _state = state.mean(-3,keepdim=True)
-    # sims,_,_,ftrs = sp_model(_state)
-
-    # -- from Eq --
-    # def sim_fxn(state):
-    #     _state = (state + 1)/2.
-    #     # state = state.mean(-3,keepdim=True)
-    #     sims,_,_,ftrs = sp_model(_state)
-    #     # -- compute grad --
-    #     mask = sims!=0
-    #     eps = 1e-15
-    #     Dkl = th.sum(tgt_sims*th.log(sims+eps)*mask,dim=(-2,-1))
-    #     # sp_grad = torch.autograd.grad(Dkl,state)[0]
-    #     return Dkl
-    # sp_grad = -torch.autograd.functional.jacobian(sim_fxn, state)[0]
-    # sp_grad = -torch.autograd.functional.jacobian(sim_fxn, state)[0]
-
-
-    # -- v2 [wrong quantity] --
-    # state = state.requires_grad_(True)
-    # state = (state + 1)/2.
-    # state = state.mean(-3,keepdim=True)
-    # sims,_,_,ftrs = sp_model(state)
-    # mask = sims!=0
-    # eps = 1e-15
-    # Dkl = th.sum(tgt_sims*th.log(sims+eps)*mask)
-    # sp_grad_v2 = torch.autograd.grad(Dkl,state)[0]
-    # print(sp_grad_v2.abs())
-
-    # -- info --
-    # print("delta: ",th.mean((sp_grad-sp_grad_v2).abs()))
-
-
-    # # print(sp_grad.abs())
-    # # print(sp_grad.abs().mean(),sp_grad.abs().std())
-    # # print(sp_grad_v2.abs().mean(),sp_grad_v2.abs().std())
-    # # exit()
-    # rescale = 1
-    # return rescale*sp_grad/alpha,sims_delta
+def superpixel_guidance_slic(state,sp_model,tgt_sims,use_for_grad=None):
 
     # -- compute grad --
-    # print(state.min(),state.max())
-    state = state.requires_grad_(True)
-    _state = (state + 1)/2.
+    state = state.clone().requires_grad_(True)
+    # _state = (state + 1)/2.
     # _state = _state.mean(-3,keepdim=True)
-    sims,_,_,ftrs = sp_model(_state)
+    # sims,_,_,ftrs = sp_model(_state)
+    sims,_,_,ftrs = sp_model(state)
     eps = 1e-15
-    expectation = th.sum((tgt_sims * th.log(sims+eps))*(tgt_sims>0),dim=(-2,-1))
-    th.autograd.backward(expectation,th.ones_like(expectation),inputs=state)
-    Ddists = state.grad
-    sp_grad = Ddists
-
-    # -- old --
-    # ftrs = ftrs.detach()
-    # scale = sp_model.affinity_softmax
-    # # state = state.requires_grad_(True)
-    # dists = get_dists(_state,ftrs,sp_model.stoken_size[0],sp_model.M)
-    # # print(dists.abs().mean(),dists.abs().std())
-    # dists = dists.reshape_as(sims)
-    # dists = th.sum((tgt_sims - sims) * dists, dim=(-1,-2))
-    # th.autograd.backward(dists,th.ones_like(dists),inputs=state)
-    # Ddists = state.grad
-
-    # print("Ddists.shape: ",Ddists.shape)
-    # delta_sims = tgt_sims - sims
-    # print("-"*10)
-    # print(tgt_sims[0,15,15,:4,:4])
-    # print(sims[0,15,15,:4,:4])
-    # print(dists[0,15,15,:4,:4])
-    # print("delta_sims.abs().mean(): ",delta_sims.abs().mean())
-    # print(dists.abs().mean())
+    expectation = th.sum((tgt_sims * th.log(sims+eps)),dim=(-2,-1))
+    if use_for_grad is None: use_for_grad = state
+    th.autograd.backward(expectation,th.ones_like(expectation),inputs=use_for_grad)
+    sp_grad = use_for_grad.grad
+    # th.autograd.backward(expectation,th.ones_like(expectation),inputs=state)
+    # sp_grad = state.grad
 
     # -- info --
     mask = sims!=0
     sims_delta = ((tgt_sims - sims)*mask).flatten(1).abs().sum(-1)
     sims_delta = sims_delta / mask.flatten(1).sum(-1)
     sims_delta = sims_delta.tolist()
-    # # print(sims_delta)
-    # # exit()
 
-    # -- grad --
-    # Dkl = th.mean(th.sum((tgt_sims - sims) * Ddists,dim=(-1,-2)))
-    # sp_grad = -torch.autograd.grad(Dkl,state)[0]
-    # sp_grad = th.sum((tgt_sims - sims) * Ddists,dim=(-1,-2))
-
-    # sp_grad = Ddists
-    # scale = 1.
-    # rescale = 0.005 #beta/alpha
-    # return rescale*(scale*sp_grad/alpha),sims_delta
-    # sp_grad = (beta/alpha)*sp_grad
-    # print(beta,alpha,sp_grad.abs().mean(),sp_grad.abs().std(),sp_grad.min(),sp_grad.max())
     return sp_grad,sims_delta
 
 # def compute_sp_target(imgs,sp_model):
 #     sims,_,_,ftrs = sp_model(_img)
 
-def load_sp_model(version,stride,scale,M):
+def load_sp_model(version,stride,scale,M,n_iters=5):
     if version == "gensp":
         from superpixel_paper.models.sp_modules import GenSP
-        model = GenSP(n_iter=5,M=M,stoken_size=stride,
+        model = GenSP(n_iter=n_iters,M=M,stoken_size=stride,
                       affinity_softmax=scale,use_grad=True,
                       gen_sp_type="reshape",return_ftrs=True)
     else:

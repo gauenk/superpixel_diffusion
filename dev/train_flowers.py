@@ -36,6 +36,30 @@ check_min_version("0.28.0.dev0")
 logger = get_logger(__name__, log_level="INFO")
 
 
+def get_batched_scales(scheduler,timesteps):
+    sp_scales = []
+    for t in timesteps:
+        sp_scales.append(get_scales(scheduler,int(t)))
+    sp_scales = th.tensor(sp_scales).to(timesteps.device)
+    return sp_scales
+
+def get_scales(scheduler,t):
+    prev_t = scheduler.previous_timestep(t)
+    alpha_prod_t = scheduler.alphas_cumprod[t]
+    one = scheduler.one
+    alpha_prod_t_prev = scheduler.alphas_cumprod[prev_t] if prev_t >= 0 else one
+    beta_prod_t = 1 - alpha_prod_t
+    beta_prod_t_prev = 1 - alpha_prod_t_prev
+    current_alpha_t = alpha_prod_t / alpha_prod_t_prev
+    current_beta_t = 1 - current_alpha_t
+    # (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+    alpha = alpha_prod_t ** (0.5)
+    beta = beta_prod_t ** (0.5)
+    # sp_scale = alpha / beta
+    sp_scale = -beta
+    return sp_scale
+
+
 def _extract_into_tensor(arr, timesteps, broadcast_shape):
     """
     Extract values from a 1-D numpy array for a batch of indices.
@@ -264,6 +288,7 @@ def parse_args():
     )
 
     args = parser.parse_args()
+    args.push_to_hub_nepochs = 5
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
@@ -385,8 +410,8 @@ def main(args):
         model = UNet2DModel.from_config(config)
 
     # -- load superpixel model --
-    stride = 4
-    scale = 2
+    stride = 8
+    scale = 1
     M = 0.
     use_ftrs = True
     sp_model = load_sp_model("gensp",stride,scale,M)
@@ -559,12 +584,14 @@ def main(args):
 
             clean_images = batch["input"].to(weight_dtype)
 
+            # print(clean_images.min(),clean_images.max())
+            # exit()
             # sample superpixel info
             tgt_sims,_,_,tgt_ftrs = sp_model(clean_images)
 
             # Sample noise that we'll add to the images
-            noise = torch.randn(clean_images.shape, dtype=weight_dtype, device=clean_images.device)
-
+            noise = torch.randn(clean_images.shape, dtype=weight_dtype,
+                                device=clean_images.device)
 
             bsz = clean_images.shape[0]
             # Sample a random timestep for each image
@@ -580,7 +607,8 @@ def main(args):
                 # Predict the noise residual
                 model_output = model(noisy_images, timesteps).sample
 
-                sp_scale = get_sp_ddpm_scale_train(noise_scheduler,timesteps,eta=1.)
+                sp_scale = get_batched_scales(noise_scheduler,timesteps)
+                # sp_scale = get_sp_ddpm_scale_train(noise_scheduler,timesteps,eta=1.)
                 sp_scale = sp_scale[:,None,None,None]
                 if th.any(th.isnan(sp_scale)):
                     print("found nan in scale")
@@ -590,14 +618,20 @@ def main(args):
                 # sp_scale = get_sp_ddim_scale(noise_scheduler,timesteps,1.)
                 sp_grad,sims_delta = superpixel_guidance(noisy_images,sp_model,
                                                          tgt_sims,tgt_ftrs,use_ftrs)
+                # print(sp_grad.abs().mean(),sp_grad.abs().min(),sp_grad.abs().max())
+                # exit()
+
                 # print(model_output.shape,sp_grad.shape,sp_scale.shape)
                 model_output = model_output + sp_scale * sp_grad
+                # model_output = model_output - sp_grad # v0
+                # model_output = model_output
                 # exit()
                 if args.prediction_type == "epsilon":
                     loss = F.mse_loss(model_output.float(), noise.float())  # this could have different weights!
                 elif args.prediction_type == "sample":
                     alpha_t = _extract_into_tensor(
-                        noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
+                        noise_scheduler.alphas_cumprod, timesteps,
+                        (clean_images.shape[0], 1, 1, 1)
                     )
                     snr_weights = alpha_t / (1 - alpha_t)
                     # use SNR weighting from distillation paper
@@ -716,13 +750,13 @@ def main(args):
                 if args.use_ema:
                     ema_model.restore(unet.parameters())
 
-                if args.push_to_hub:
-                    upload_folder(
-                        repo_id=repo_id,
-                        folder_path=args.output_dir,
-                        commit_message=f"Epoch {epoch}",
-                        ignore_patterns=["step_*", "epoch_*"],
-                    )
+                # if args.push_to_hub and (args.push_to_hub_nepochs % epoch) == 0:
+                #     upload_folder(
+                #         repo_id=repo_id,
+                #         folder_path=args.output_dir,
+                #         commit_message=f"Epoch {epoch}",
+                #         ignore_patterns=["step_*", "epoch_*"],
+                #     )
 
     accelerator.end_training()
 

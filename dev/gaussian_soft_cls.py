@@ -208,7 +208,7 @@ def sample_mixture(means,cov,pi,nsamples):
     data = np.concatenate(data)
     return data
 
-def main():
+def run_exp():
 
     nsamples = 2000
     pi = np.array([0.5,0.5])
@@ -281,6 +281,9 @@ def main():
 
     # plt.savefig("gaussian_soft_cls_cov1.png",dpi=200)
     plt.savefig("gaussian_soft_cls.png",dpi=200)
+
+def main():
+    run_exp()
 
 if __name__ == "__main__":
     main()
