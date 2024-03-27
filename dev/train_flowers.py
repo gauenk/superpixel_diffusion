@@ -37,11 +37,14 @@ logger = get_logger(__name__, log_level="INFO")
 
 
 def get_batched_scales(scheduler,timesteps):
-    sp_scales = []
+    alpha,beta = [],[]
     for t in timesteps:
-        sp_scales.append(get_scales(scheduler,int(t)))
-    sp_scales = th.tensor(sp_scales).to(timesteps.device)
-    return sp_scales
+        alpha_t,beta_t = get_scales(scheduler,int(t))
+        alpha.append(alpha_t)
+        beta.append(beta_t)
+    alpha = th.tensor(alpha).to(timesteps.device)[:,None,None,None]
+    beta = th.tensor(beta).to(timesteps.device)[:,None,None,None]
+    return alpha,beta
 
 def get_scales(scheduler,t):
     prev_t = scheduler.previous_timestep(t)
@@ -55,9 +58,7 @@ def get_scales(scheduler,t):
     # (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
     alpha = alpha_prod_t ** (0.5)
     beta = beta_prod_t ** (0.5)
-    # sp_scale = alpha / beta
-    sp_scale = -beta
-    return sp_scale
+    return alpha,beta
 
 
 def _extract_into_tensor(arr, timesteps, broadcast_shape):
@@ -414,6 +415,7 @@ def main(args):
     scale = 1
     M = 0.
     use_ftrs = True
+    use_deno_sp = True
     sp_model = load_sp_model("gensp",stride,scale,M)
 
     # Create EMA for the model.
@@ -605,30 +607,39 @@ def main(args):
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
-                model_output = model(noisy_images, timesteps).sample
 
-                sp_scale = get_batched_scales(noise_scheduler,timesteps)
+                alpha,beta = get_batched_scales(noise_scheduler,timesteps)
+                model_output = model(noisy_images, timesteps).sample
+                deno = (noisy_images - beta*model_output)/alpha
+                deno = th.clip(deno,-1,1)
+
                 # sp_scale = get_sp_ddpm_scale_train(noise_scheduler,timesteps,eta=1.)
-                sp_scale = sp_scale[:,None,None,None]
-                if th.any(th.isnan(sp_scale)):
-                    print("found nan in scale")
-                    print(sp_scale)
-                    exit()
+                # sp_scale = sp_scale[:,None,None,None]
+                # if th.any(th.isnan(sp_scale)):
+                #     print("found nan in scale")
+                #     print(sp_scale)
+                #     exit()
                 # print(sp_scale)
                 # sp_scale = get_sp_ddim_scale(noise_scheduler,timesteps,1.)
-                sp_grad,sims_delta = superpixel_guidance(noisy_images,sp_model,
+                sp_input = deno if use_deno_sp else noisy_images
+                sp_grad,sims_delta = superpixel_guidance(sp_input,sp_model,
                                                          tgt_sims,tgt_ftrs,use_ftrs)
                 # print(sp_grad.abs().mean(),sp_grad.abs().min(),sp_grad.abs().max())
                 # exit()
                 # -- I think the training term needs to change. --
+                # model_output = model_output + sp_scale * sp_grad
 
                 # print(model_output.shape,sp_grad.shape,sp_scale.shape)
-                model_output = model_output + sp_scale * sp_grad
-                # model_output = model_output - sp_grad # v0
-                # model_output = model_output
+
+                # -- updated term --
+                deno_aug = deno + beta**2/alpha * sp_grad
+                deno_aug = th.clip(deno_aug,-1,1)
+                # print(deno.min(),deno.max(),clean_images.min(),clean_images.max(),
+                #       noisy_images.min(),noisy_images.max())
                 # exit()
                 if args.prediction_type == "epsilon":
                     loss = F.mse_loss(model_output.float(), noise.float())  # this could have different weights!
+                    loss += 0.5*F.mse_loss(deno_aug.float(),clean_images.float())
                 elif args.prediction_type == "sample":
                     alpha_t = _extract_into_tensor(
                         noise_scheduler.alphas_cumprod, timesteps,

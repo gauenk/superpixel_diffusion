@@ -5,9 +5,12 @@ import torch as th
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 
-def get_grid(nsamples,ulim,llim):
-    xi,yi = np.mgrid[-llim:ulim:nsamples*1j,-llim:ulim:nsamples*1j]
+def get_grid(nsamples,ulim,llim,ulim_y=None,llim_y=None):
+    if ulim_y is None: ulim_y = ulim
+    if llim_y is None: llim_y = llim
+    xi,yi = np.mgrid[llim:ulim:nsamples*1j,llim_y:ulim_y:nsamples*1j]
     x,y = xi.ravel(),yi.ravel()
     grid = th.from_numpy(np.stack([x,y]).T)
     return grid
@@ -143,11 +146,13 @@ def main():
     #
     # -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
-    nsamples,ulim,llim = 50,1.5,1.5
-    grid = get_grid(nsamples,ulim,llim)
-    nsamples = 20
-    grid = get_grid(nsamples,ulim,llim)
-    gmm_probs = get_gmm_prob(grid,means,cov*.1,pi)
+    nsamples,ulim,llim = 50,2,-2
+    ns = nsamples
+    gmm_grid = get_grid(nsamples,ulim,llim)
+    gmm_probs = get_gmm_prob(gmm_grid,means,cov*.1,pi)
+    nsamples,ulim,llim = 20,2,0.
+    ulim_y,llim_y = 1,-1
+    grid = get_grid(nsamples,ulim,llim,ulim_y,llim_y)
     cls_probs = th.zeros(len(means))
     for k in range(len(means)):
         cls_probs[k] = get_classifier_lprob(means[[0]],means,cov,pi,k)
@@ -166,22 +171,34 @@ def main():
     #                                           means_r,cov_r,pi_r,cls_probs)
 
     # -- plot --
-    ginfo = {'wspace':0.0, 'hspace':0.0,
-             "top":.9,"bottom":0.1,"left":0.05,"right":0.99}
+    ginfo = {'wspace':0.05, 'hspace':0.0,
+             "top":.9,"bottom":0.01,"left":0.01,"right":0.99}
     fig,ax = plt.subplots(1,4,figsize=(12,3),gridspec_kw=ginfo)
-    ns = nsamples
-    ax[0].pcolormesh(mshape(grid[:,0],ns),mshape(grid[:,1],ns),mshape(gmm_probs,ns),
-                     shading='gouraud',cmap=plt.cm.Blues)
-    print("Hard: ",th.mean((hard_cls_field - gt_cls_field)**2))
-    print("Soft: ",th.mean((soft_cls_field - gt_cls_field)**2))
-    u,v = hard_cls_field[:,0],hard_cls_field[:,1]
+    ax[0].pcolormesh(mshape(gmm_grid[:,0],ns),mshape(gmm_grid[:,1],ns),
+                     mshape(gmm_probs,ns),shading='gouraud',cmap=plt.cm.Blues)
+    rect = patches.Rectangle((0.,-1), 1.98, 1.98, linewidth=2,
+                             edgecolor='r', facecolor='none')
+    ax[0].add_patch(rect)
+
+    u,v = gt_cls_field[:,0],gt_cls_field[:,1]
     ax[1].quiver(grid[:,0],grid[:,1],u,v)
+
     u,v = soft_cls_field[:,0],soft_cls_field[:,1]
     ax[2].quiver(grid[:,0],grid[:,1],u,v)
-    u,v = gt_cls_field[:,0],gt_cls_field[:,1]
+
+    u,v = hard_cls_field[:,0],hard_cls_field[:,1]
     ax[3].quiver(grid[:,0],grid[:,1],u,v)
 
-    plt.savefig("vector_field_classifier.png")
+    print("Soft: ",th.mean((soft_cls_field - gt_cls_field)**2))
+    print("Hard: ",th.mean((hard_cls_field - gt_cls_field)**2))
+
+    for i in range(len(ax)): ax[i].axis('off')
+    ax[0].set_title(r"Gaussian Mixture Model")
+    ax[1].set_title(r"Groundtruth")
+    ax[2].set_title(r"Soft Classifier Guidance")
+    ax[3].set_title(r"Hard Classifier Guidance")
+
+    plt.savefig("vector_field_classifier.png",transparent=False,dpi=200)
 
 if __name__ == "__main__":
     main()

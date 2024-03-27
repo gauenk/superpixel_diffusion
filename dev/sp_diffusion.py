@@ -35,7 +35,7 @@ from superpixel_diffusion.guidance import load_sp_model
 
 def inference(model,scheduler,state,sp_model,
               tgt_sims,tgt_ftrs,use_sp_guidance,rescale,use_ftrs,
-              update_target=False):
+              update_target=False,use_deno_sp=False,use_closed_form=False):
 
     eta = 1.
     info = edict()
@@ -46,10 +46,12 @@ def inference(model,scheduler,state,sp_model,
         sched_kwargs = {}
 
     for t in tqdm(scheduler.timesteps):
-        # with torch.no_grad():
 
-        state = state.clone().requires_grad_(True)
-        rescaled_score = model(state, t).sample
+        # -- optionally enable grad --
+        with torch.set_grad_enabled(use_deno_sp):
+            if use_deno_sp:
+                state = state.requires_grad_(True)
+            rescaled_score = model(state, t).sample
 
         # -- compute score --
         # state = state.requires_grad_(True)
@@ -59,6 +61,7 @@ def inference(model,scheduler,state,sp_model,
         sched_dict = scheduler.step(rescaled_score, t, state, **sched_kwargs)
         # next_state = sched_dict.prev_sample
         deno = sched_dict.pred_original_sample
+        deno = th.clip(deno,-1,1)
 
         # -- add guidance --
         # sp_scale = get_sp_ddim_scale_inference(scheduler,t,eta)
@@ -69,16 +72,23 @@ def inference(model,scheduler,state,sp_model,
         #       (state.min().item(),state.max().item()),
         #       ((tgt_ftrs).min().item(),(tgt_ftrs).max().item()))
         # exit()
-        # sp_input,use_for_grad = deno,state
-        sp_input,use_for_grad = state,state
+        if use_deno_sp:
+            sp_input,use_for_grad = deno,state
+        else:
+            sp_input = state.requires_grad_(True)
+            use_for_grad = sp_input
+        alpha,beta,var,s_alpha = get_scales(scheduler,t)
         sp_grad,sims_delta = superpixel_guidance(sp_input,sp_model,
                                                  tgt_sims,tgt_ftrs,use_ftrs,
-                                                 use_for_grad=use_for_grad)
+                                                 use_for_grad=use_for_grad,
+                                                 use_closed_form=use_closed_form)
         # print("sp_input: ",sp_input.mean().item(),sp_input.min().item(),sp_input.max().item())
         #print("state: ",state.mean().item(),state.min().item(),state.max().item())
         # print("tgt_ftrs: ",tgt_ftrs.mean().item(),tgt_ftrs.min().item(),tgt_ftrs.max().item())
         # print("grad: ",sp_grad.abs().mean().item(),
         #       sp_grad.abs().min().item(),sp_grad.abs().max().item())
+        # print("rescaled_score: ",rescaled_score.abs().mean().item(),
+        #       rescaled_score.abs().min().item(),rescaled_score.abs().max().item())
         if use_sp_guidance is False: sp_grad[...] = 0.
         # print("grad: ",sp_grad.abs().mean().item(),
         #       sp_grad.abs().min().item(),sp_grad.abs().max().item(),use_sp_guidance)
@@ -89,11 +99,10 @@ def inference(model,scheduler,state,sp_model,
         # rescale_score is negative of score function.
         # sp_scale = 1.
         alpha,beta,var,s_alpha = get_scales(scheduler,t)
-        # print(beta)
         rescaled_score = rescaled_score + rescale * (-beta) * sp_grad
         # rescaled_score = rescaled_score - rescale * sp_grad
         # print(sp_scale)
-        sched_dict = scheduler.step(rescaled_score, t, state, **sched_kwargs)
+        sched_dict = scheduler.step(rescaled_score, t, state.detach(), **sched_kwargs)
         state = sched_dict.prev_sample.detach() # next_state -> state
         # state = state + rescale * sp_scale * sp_grad
 
@@ -150,23 +159,6 @@ def save_image(name,input,proc=True,with_grid=True):
         grid = tv_utils.make_grid(input)[None,:]
         tv_utils.save_image(grid,Path(name)/"grid.png")
 
-def get_tgt_sp_celeb(sp_model,B,H,W):
-    assert (H==W) and (H==256), "Must be 256."
-    root = Path("/home/gauenk/Documents/data/celebhqa_256/images/")
-    fns = [fn for fn in root.iterdir() if fn.suffix == ".jpg"]
-    idx_list = np.random.permutation(len(fns))[:B]
-    imgs = []
-    for idx in idx_list:
-        img_fn = fns[idx]
-        img = Image.open(img_fn)#.convert("RGB")
-        img = th.from_numpy(np.array(img))/255.
-        img = rearrange(img,'h w c -> 1 c h w').cuda()
-        # _img = img.mean(-3,keepdim=True)
-        _img = img
-        imgs.append(img)
-    imgs = th.cat(imgs)
-    return imgs
-
 def get_tgt_sp_celeb_woman(sp_model,H,W):
     img_fn = "diff_output/sample/woman.jpg"
     img = Image.open(img_fn).convert("RGB")
@@ -179,16 +171,45 @@ def get_tgt_sp_celeb_woman(sp_model,H,W):
     # _img = img.mean(-3,keepdim=True)
     return img
 
+def get_tgt_sp_celeb(sp_model,B,H,W):
+    assert (H==W) and (H==256), "Must be 256."
+    root = name_to_path("celeb")
+    # root = Path("/home/gauenk/Documents/data/celebhqa_256/images/")
+    return load_sp_from_root(root,sp_model,B,H,W,flip_colors=False)
+    # fns = [fn for fn in root.iterdir() if fn.suffix == ".jpg"]
+    # idx_list = np.random.permutation(len(fns))[:B]
+    # imgs = []
+    # for idx in idx_list:
+    #     img_fn = fns[idx]
+    #     img = Image.open(img_fn)#.convert("RGB")
+    #     img = th.from_numpy(np.array(img))/255.
+    #     img = rearrange(img,'h w c -> 1 c h w').cuda()
+    #     # _img = img.mean(-3,keepdim=True)
+    #     _img = img
+    #     imgs.append(img)
+    # imgs = th.cat(imgs)
+    # return imgs
+
 def get_tgt_sp_cifar(sp_model,B,H,W):
-    root = Path("/home/gauenk/Documents/data/cifar-10/images/")
-    return load_sp_from_root(root,sp_model,B,H,W,ext=".png",flip_colors=True)
+    root = name_to_path("cifar10")
+    return load_sp_from_root(root,sp_model,B,H,W,flip_colors=True)
 
 def get_tgt_sp_flowers(sp_model,B,H,W):
-    root = Path("/home/gauenk/Documents/data/102flowers/images/")
-    return load_sp_from_root(root,sp_model,B,H,W,ext=".jpg",resize=True)
+    root = name_to_path("flowers")
+    return load_sp_from_root(root,sp_model,B,H,W,resize=True)
 
-def load_sp_from_root(root,sp_model,B,H,W,ext=".png",resize=False,flip_colors=False):
-    fns = [fn for fn in root.iterdir() if fn.suffix == ext]
+def name_to_path(name):
+    if "celeb" in name:
+        return Path("/home/gauenk/Documents/data/celebhqa_256/images/")
+    elif "cifar10" in name:
+        return Path("/home/gauenk/Documents/data/cifar-10/images/")
+    elif "flowers" in name:
+        return Path("/home/gauenk/Documents/data/102flowers/images/")
+    else:
+        raise KeyError(f"Uknown path name [{name}]")
+
+def load_sp_from_root(root,sp_model,B,H,W,resize=False,flip_colors=False):
+    fns = [fn for fn in root.iterdir() if fn.suffix in [".jpg",".png"]]
     idx_list = np.random.permutation(len(fns))[:B]
     imgs = []
     for idx in idx_list:
@@ -200,26 +221,26 @@ def load_sp_from_root(root,sp_model,B,H,W,ext=".png",resize=False,flip_colors=Fa
         if flip_colors:
             img = img.flip(-3)
         # _img = img.mean(-3,keepdim=True)
-        _img = img
+        # print(img.shape)
         imgs.append(img)
     imgs = th.cat(imgs)
     return imgs
 
-def get_tgt_sp(sp_model,H,W):
-    root = Path("data/sr/BSD500/images/all/")
-    fns = [fn for fn in root.iterdir() if fn.suffix == ".jpg"]
-    idx = np.random.permutation(len(fns))[10]
-    # print(fns,idx)
-    # img_fn = "data/sr/BSD500/images/all/8023.jpg"
-    img_fn = str(fns[idx])
-    img = Image.open(img_fn)
-    img = th.from_numpy(np.array(img))/255.
-    img = rearrange(img,'h w c -> 1 c h w').cuda()
+# def get_tgt_sp(sp_model,H,W):
+#     root = Path("data/sr/BSD500/images/all/")
+#     fns = [fn for fn in root.iterdir() if fn.suffix == ".jpg"]
+#     idx = np.random.permutation(len(fns))[10]
+#     # print(fns,idx)
+#     # img_fn = "data/sr/BSD500/images/all/8023.jpg"
+#     img_fn = str(fns[idx])
+#     img = Image.open(img_fn)
+#     img = th.from_numpy(np.array(img))/255.
+#     img = rearrange(img,'h w c -> 1 c h w').cuda()
 
-    from torchvision.transforms import v2
-    transform = v2.RandomCrop(size=(H,W))
-    img = transform(img)
-    return img
+#     from torchvision.transforms import v2
+#     transform = v2.RandomCrop(size=(H,W))
+#     img = transform(img)
+#     return img
 
 def get_tgt_sp(ddpm_name,sp_model,B,H,W):
     if "celeb" in ddpm_name:
@@ -229,8 +250,9 @@ def get_tgt_sp(ddpm_name,sp_model,B,H,W):
     elif "flowers" in ddpm_name:
         imgs = get_tgt_sp_flowers(sp_model,B,H,W)
     else:
-        imgs = get_tgt_sp_rand(sp_model,H,W)
+        raise ValueError(f"Uknown data name [{ddpm_name}]")
     imgs = 2.*imgs-1.
+    # print(imgs.min().item(),imgs.max().item())
     sims,_,_,ftrs = sp_model(imgs)
     return imgs,sims,ftrs
 
@@ -276,13 +298,14 @@ def load_model(model_config_name_or_path,chkpt_path,nsteps,res):
 
 def extract_defaults(cfg):
     cfg = dcopy(cfg)
-    pairs = {"model_chkpt":None,"update_target":False}
+    pairs = {"model_chkpt":None,"update_target":False,"use_deno_sp":False,
+             "use_closed_form":False}
     for key in pairs:
         if key in cfg: continue
         cfg[key] = pairs[key]
     return cfg
 
-def run_exp(cfg):
+def run_exp(cfg,sp_img=None):
 
     # -- init seed --
     # exp_name,seed,B,nsteps,use_sp_guidance,
@@ -331,7 +354,10 @@ def run_exp(cfg):
 
     # -- sample superpixel --
     H,W = sample_size,sample_size
-    sp_img,tgt_sims,tgt_ftrs = get_tgt_sp(sp_source,sp_model,cfg.B,H,W)
+    if sp_img is None:
+        sp_img,tgt_sims,tgt_ftrs = get_tgt_sp(sp_source,sp_model,cfg.B,H,W)
+    else:
+        tgt_sims,_,_,tgt_ftrs = sp_model(sp_img)
     # print("sp_img.min(),sp_img.max(): ",sp_img.min(),sp_img.max())
     # exit()
     save_image("sp_img",sp_img)
@@ -351,7 +377,8 @@ def run_exp(cfg):
     sample,info = inference(model,scheduler,noise,sp_model,
                             tgt_sims,tgt_ftrs,
                             cfg.use_sp_guidance,cfg.rescale,cfg.use_ftrs,
-                            cfg.update_target)
+                            cfg.update_target,cfg.use_deno_sp,
+                            cfg.use_closed_form)
 
     # -- viz delta superpixel sims --
     format_info(info)
@@ -369,6 +396,68 @@ def run_exp(cfg):
     if not save_root_g.exists(): save_root_g.mkdir(parents=True)
     grid = (tv_utils.make_grid(sample)[None,:] + 1)/2.
     tv_utils.save_image(grid,save_root_g/"grid.png")
+    return sample
+
+def search_images(stnd,sp_model,use_ftrs,sp_source,
+                  max_num=-1,tol=1e-3,max_nochange=1000):
+    def read_fn(fn,flip_colors,device):
+        img = Image.open(fn)
+        img = th.from_numpy(np.array(img))/255.
+        img = rearrange(img,'h w c -> 1 c h w').cuda()
+        # if resize:
+        #     img = TF.resize(img,(H,W),InterpolationMode.BILINEAR)
+        if flip_colors:
+            img = img.flip(-3)
+        img = 2.*img.to(device)-1
+        return img
+
+    # -- compute reference --
+    tgt_sims,_,_,tgt_ftrs = sp_model(stnd)
+
+    # -- init --
+    device = stnd.device
+    root = name_to_path(sp_source)
+    flip_colors= "cifar10" in sp_source
+    fns = [fn for fn in root.iterdir() if fn.suffix in [".jpg",".png"]]
+    idx_list = np.random.permutation(len(fns))
+    if max_num > 0: idx_list = idx_list[:max_num]
+    nochange = 0
+    index = -1
+    min_dists = 1e10*th.ones(len(stnd),device=device)
+    min_inds = -1*th.ones(len(stnd),device=device)
+    min_dists_prev = min_dists.clone()
+    for idx in tqdm(idx_list,desc="searching images."):
+
+        # -- read image --
+        img = read_fn(fns[idx],flip_colors,device)
+
+        # -- compute sp --
+        prop_sims,_,_,prop_ftrs = sp_model(img)
+
+        # -- compute dists --
+        # dists = (stnd - img).flatten(1).pow(2).mean(-1)
+        # dists = (prop_sims - tgt_sims).flatten(1).pow(2).mean(-1)
+        # if use_ftrs:
+        #     dists += (prop_ftrs - tgt_ftrs).flatten(1).pow(2).mean(-1)
+        dists = (prop_ftrs - tgt_ftrs).flatten(1).pow(2).mean(-1)
+        min_inds = th.where(dists < min_dists,idx,min_inds)
+        min_dists = th.where(dists < min_dists,dists,min_dists)
+
+        # -- stop early if no updates --
+        delta_dists = th.abs(min_dists - min_dists_prev).sum()
+        if delta_dists < 1e-8: nochange += 1
+        else: nochange = 0
+        if (max_nochange > 0) and (nochange >= max_nochange): break
+
+        # -- update previous dists --
+        min_dists_prev = min_dists.clone()
+        # print(min_dists)
+
+    srch = []
+    for idx in min_inds.long().tolist():
+        srch.append(read_fn(fns[idx],flip_colors,device))
+    srch = th.cat(srch)
+    return srch
 
 def format_info(info):
     np.set_printoptions(precision=3)
@@ -426,7 +515,7 @@ def run_batched_cifar10():
     cfg.use_sp_guidance = True
     cfg.ddpm_sched_name = "google/ddpm-cifar10-32"
     cfg.stride = 8
-    cfg.scale = 2.
+    cfg.scale = 1.
     cfg.M = 0
     cfg.rescale = 1.
     cfg.use_ftrs = True
@@ -435,6 +524,7 @@ def run_batched_cifar10():
     cfg.sp_source = "cifar10"
     cfg.tag = "v0"
     cfg.model_name = cfg.ddpm_sched_name
+    cfg.sp_niters = 5
 
     # # -- config --
     # cfg = edict()
@@ -452,7 +542,7 @@ def run_batched_cifar10():
     # cfg.model_chkpt = None
 
     # -- run each --
-    N = int((1e3-1)//cfg.B+1)
+    N = int((6e4-1)//cfg.B+1)
     print("N: ",N)
     cfg.exp_name = "batched_v1/cond_dev"
     cfg.use_sp_guidance = True
@@ -473,23 +563,27 @@ def main():
 
     # -- config --
     cfg = edict()
-    cfg.seed = 456
+    # cfg.seed = 456
     # cfg.seed = 567
-    cfg.B = 16
+    cfg.seed = 567+1
+    cfg.B = 8
     cfg.nsteps = 100
     cfg.use_sp_guidance = True
     # cfg.ddpm_sched_name = "google/ddpm-cat-256"
-    cfg.ddpm_sched_name = "google/ddpm-celebahq-256"
-    # cfg.ddpm_sched_name = "google/ddpm-cifar10-32"
+    # cfg.ddpm_sched_name = "google/ddpm-celebahq-256"
+    cfg.ddpm_sched_name = "google/ddpm-cifar10-32"
     cfg.stride = 8
-    cfg.scale = 1.
+    cfg.scale = .5
     cfg.M = 0
     cfg.rescale = 1.
-    cfg.use_ftrs = True
+    cfg.use_deno_sp = False
+    cfg.use_closed_form = True
+    cfg.use_ftrs = False
     cfg.update_target = False
-    cfg.sp_niters = 5
+    cfg.sp_niters = 10
     cfg.model_name = None
     # nsteps = 25500
+    cfg.model_name = cfg.ddpm_sched_name
     # cfg.model_chkpt = "ddpm-ema-flowers-64-sp-03-24/checkpoint-%d/unet" % nsteps
     # cfg.model_chkpt = "ddpm-ema-flowers-64-sp-03-24"
     # cfg.model_chkpt = "ddpm-ema-flowers-64-sp-st8-sc1-m0-fF"
@@ -498,22 +592,15 @@ def main():
     # cfg.model_chkpt = "ddpm-ema-flowers-64-sp-v0-st8-sc1-m0-fF"
     # cfg.model_nsteps = 12000
     # cfg.model_chkpt = "ddpm-ema-flowers-64-sp-v0p1-st8-sc1-m0-fT"
-    cfg.model_chkpt = "ddpm-ema-flowers-64-sp-v0p1-st8-sc1-m0-fT"
-    cfg.model_nsteps = 20500
-    cfg.sp_source = "flowers"
-    # cfg.sp_source = "cifar10"
+    # cfg.model_chkpt = "ddpm-ema-flowers-64-sp-v0p2-st8-sc1-m0-fT"
+    # cfg.model_chkpt = "ddpm-ema-flowers-64-sp-v0p2-st8-sc1-m0-fT-dT"
+    # cfg.model_nsteps = 20000
+    # cfg.sp_source = "flowers"
+    # cfg.model_name = None
+
+    cfg.sp_source = "cifar10"
     # cfg.sp_source = "celeb"
     cfg.tag = "v0"
-    # cfg.model_name = cfg.ddpm_sched_name
-
-    # -- conditional --
-    cfg.exp_name = "cond_dev"
-    cfg.use_sp_guidance = True
-    # cfg.model_chkpt = "ddpm-ema-flowers-64"
-    # cfg.tag = "v0"
-    # run_exp(cfg)
-    # cfg.model_chkpt = "ddpm-ema-flowers-64-sp-03-24"
-    run_exp(cfg)
 
     # -- standard --
     cfg.exp_name = "stand_dev"
@@ -523,7 +610,21 @@ def main():
     # run_exp(cfg)
     # cfg.model_chkpt = "ddpm-ema-flowers-64-sp-03-24"
     # cfg.model_chkpt = "ddpm-ema-flowers-64-sp/checkpoint-%d/unet" % nsteps
-    run_exp(cfg)
+    # stnd = run_exp(cfg)
+
+    # sp_model = load_sp_model("gensp",cfg.stride,cfg.scale,cfg.M,cfg.sp_niters)
+    # use_ftrs = False
+    # srch = search_images(stnd,sp_model,use_ftrs,cfg.sp_source,max_num=10000)
+    srch = None
+
+    # -- conditional --
+    cfg.exp_name = "cond_dev"
+    cfg.use_sp_guidance = True
+    # cfg.model_chkpt = "ddpm-ema-flowers-64"
+    # cfg.tag = "v0"
+    # run_exp(cfg)
+    # cfg.model_chkpt = "ddpm-ema-flowers-64-sp-03-24"
+    run_exp(cfg,srch)
 
 if __name__ == "__main__":
     main()

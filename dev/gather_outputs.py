@@ -21,11 +21,12 @@ def run_gather_batch(name,num,ddpm_name,subname):
             src_fn = src_fn.resolve()
             # print(src_fn,dest_fn)
             # break
+            if dest_fn.exists(): continue
             os.symlink(str(src_fn),str(dest_fn))
 
 def main():
     B = 500
-    N = int((1e3-1)//B+1)
+    N = int((6e4-1)//B+1)
     # N = int((1e4-1)//B+1)
 
     # -- v0 --

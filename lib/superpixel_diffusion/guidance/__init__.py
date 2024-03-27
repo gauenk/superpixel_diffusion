@@ -13,75 +13,107 @@ from easydict import EasyDict as edict
 import torchvision.utils as tv_utils
 from superpixel_paper.models.sp_modules import dists_to_sims,get_dists,expand_dists
 
-def superpixel_guidance(state,sp_model,tgt_sims,tgt_ftrs,use_ftrs,use_for_grad=None):
-    if use_ftrs:
-        return superpixel_guidance_ftrs(state,sp_model,tgt_sims,tgt_ftrs,use_for_grad)
+def superpixel_guidance(state,sp_model,tgt_sims,tgt_ftrs,use_ftrs,
+                        use_for_grad=None,use_closed_form=False):
+    if use_ftrs is True:
+        return superpixel_guidance_ftrs(state,sp_model,tgt_sims,tgt_ftrs,
+                                        use_for_grad,use_closed_form)
     else:
-        return superpixel_guidance_slic(state,sp_model,tgt_sims,use_for_grad)
+        return superpixel_guidance_slic(state,sp_model,tgt_sims,
+                                        use_for_grad,use_closed_form)
 
-def superpixel_guidance_ftrs(state,sp_model,tgt_sims,tgt_ftrs,use_for_grad=None):
+def superpixel_guidance_ftrs(state,sp_model,tgt_sims,tgt_ftrs,
+                             use_for_grad=None,use_closed_form=False):
 
     # -- compute current sims --
-    H,W = state.shape[-2:]
-    state = state.clone().requires_grad_(True)
+    if use_for_grad is None:
+        state = state.clone().requires_grad_(True)
+        use_for_grad = state
+
+
+    # -- compute expectation --
+    if use_closed_form:
+        sp_grad = compute_min_expectation(sp_model,state,tgt_sims,tgt_ftrs)
+    else:
+        sp_grad = compute_grad_expectation(sp_model,state,tgt_sims,tgt_ftrs,use_for_grad)
+
+    # -- info --
+    mask = sims!=0
+    sims_delta = ((tgt_sims - sims)*mask).flatten(1).abs().sum(-1)
+    sims_delta = sims_delta / mask.flatten(1).sum(-1)
+    sims_delta = sims_delta.tolist()
+
+    return sp_grad,sims_delta
+
+def superpixel_guidance_slic(state,sp_model,tgt_sims,
+                             use_for_grad=None,use_closed_form=False):
+
+    # -- compute grad --
+    # if use_for_grad is None:
+    #     state = state.clone().requires_grad_(True)
+    #     use_for_grad = state
     # _state = (state + 1)/2.
     # _state = _state.mean(-3,keepdim=True)
+    # sims,_,_,ftrs = sp_model(_state)
+    _,_,_,ftrs = sp_model(state)
+    ftrs = ftrs.detach()
+    return superpixel_guidance_ftrs(state,sp_model,tgt_sims,ftrs,
+                                    use_for_grad,use_closed_form)
+
+def compute_min_expectation(sp_model,state,tgt_sims,tgt_ftrs):
+    # -- compute sims --
+    H,W = state.shape[-2:]
     scale = sp_model.affinity_softmax
     stride = sp_model.stoken_size[0]
     dists = get_dists(state,tgt_ftrs,stride,sp_model.M)
     sims = dists_to_sims(dists,H,W,scale,stride)
-    # dists = expand_dists(dists,state,stride)
-    # print(sims[0,0,0,:3,:3])
-    # print(sims[0,10,10,:3,:3])
-    # print("-"*20)
-    # print(dists[0,0,0,:3,:3])
-    # print(dists[0,10,10,:3,:3])
-    # print("-"*20)
-    # print(sims.shape,dists.shape)
-    # exit()
-    # sims = dists_to_sims(dists,scale,stride)
+    th.autograd.backward(sims,th.ones_like(sims),inputs=dists)
+    sim_mat = dists.grad/sims
+    th.autograd.backward(dists,th.ones_like(dists),inputs=state)
+    sgrad = state.grad + state # \sum N(z;\mu_i,\alpha_i)\mu_i
+
+    return sgrad
+
+def compute_grad_expectation(sp_model,state,tgt_sims,tgt_ftrs,use_for_grad):
+
+    # -- compute sims --
+    H,W = state.shape[-2:]
+    scale = sp_model.affinity_softmax
+    stride = sp_model.stoken_size[0]
+    dists = get_dists(state,tgt_ftrs,stride,sp_model.M)
+    sims = dists_to_sims(dists,H,W,scale,stride)
 
     # -- compute expectation --
     eps = 1e-15
     expectation = th.sum((tgt_sims * th.log(sims+eps)),dim=(-2,-1))
-    if use_for_grad is None: use_for_grad = state
     th.autograd.backward(expectation,th.ones_like(expectation),inputs=use_for_grad)
     sp_grad = use_for_grad.grad
+    return sp_grad
 
-    # -- info --
-    mask = sims!=0
-    sims_delta = ((tgt_sims - sims)*mask).flatten(1).abs().sum(-1)
-    sims_delta = sims_delta / mask.flatten(1).sum(-1)
-    sims_delta = sims_delta.tolist()
 
-    return sp_grad,sims_delta
+#     scale = sp_model.affinity_softmax
+#     stride = sp_model.stoken_size[0]
+#     H,W = state.shape[-2:]
+#     dists = get_dists(state,ftrs,stride,sp_model.M)
+#     sims = dists_to_sims(dists,H,W,scale,stride)
 
-def superpixel_guidance_slic(state,sp_model,tgt_sims,use_for_grad=None):
+#     eps = 1e-15
+#     expectation = th.sum((tgt_sims * th.log(sims+eps)),dim=(-2,-1))
+#     th.autograd.backward(expectation,th.ones_like(expectation),inputs=use_for_grad)
+#     sp_grad = use_for_grad.grad
+#     # th.autograd.backward(expectation,th.ones_like(expectation),inputs=state)
+#     # sp_grad = state.grad
 
-    # -- compute grad --
-    state = state.clone().requires_grad_(True)
-    # _state = (state + 1)/2.
-    # _state = _state.mean(-3,keepdim=True)
-    # sims,_,_,ftrs = sp_model(_state)
-    sims,_,_,ftrs = sp_model(state)
-    eps = 1e-15
-    expectation = th.sum((tgt_sims * th.log(sims+eps)),dim=(-2,-1))
-    if use_for_grad is None: use_for_grad = state
-    th.autograd.backward(expectation,th.ones_like(expectation),inputs=use_for_grad)
-    sp_grad = use_for_grad.grad
-    # th.autograd.backward(expectation,th.ones_like(expectation),inputs=state)
-    # sp_grad = state.grad
+#     # -- info --
+#     mask = sims!=0
+#     sims_delta = ((tgt_sims - sims)*mask).flatten(1).abs().sum(-1)
+#     sims_delta = sims_delta / mask.flatten(1).sum(-1)
+#     sims_delta = sims_delta.tolist()
 
-    # -- info --
-    mask = sims!=0
-    sims_delta = ((tgt_sims - sims)*mask).flatten(1).abs().sum(-1)
-    sims_delta = sims_delta / mask.flatten(1).sum(-1)
-    sims_delta = sims_delta.tolist()
+#     return sp_grad,sims_delta
 
-    return sp_grad,sims_delta
-
-# def compute_sp_target(imgs,sp_model):
-#     sims,_,_,ftrs = sp_model(_img)
+# # def compute_sp_target(imgs,sp_model):
+# #     sims,_,_,ftrs = sp_model(_img)
 
 def load_sp_model(version,stride,scale,M,n_iters=5):
     if version == "gensp":
