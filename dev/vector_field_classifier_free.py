@@ -7,8 +7,10 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
-def get_grid(nsamples,ulim,llim):
-    xi,yi = np.mgrid[llim:ulim:nsamples*1j,llim:ulim:nsamples*1j]
+def get_grid(nsamples,ulim,llim,ulim_y=None,llim_y=None):
+    if ulim_y is None: ulim_y = ulim
+    if llim_y is None: llim_y = llim
+    xi,yi = np.mgrid[llim:ulim:nsamples*1j,llim_y:ulim_y:nsamples*1j]
     x,y = xi.ravel(),yi.ravel()
     grid = th.from_numpy(np.stack([x,y]).T)
     return grid
@@ -28,32 +30,31 @@ def get_gaussian_prob(grid,mean,cov):
     probs = th.exp(-1/2 * th.sum(delta * mat,-1))
     return const * probs
 
-def get_implicit_cls_lprob(grid,means,cov,pi,k0):
+def get_classifier_lprob(grid,means,cov,pi,k0):
     # -- compute log prob --
-    prob = 0
-    for k in range(len(pi)):
-        prob += pi[k] * get_gaussian_prob(grid,means[k],cov[k])
+    prob = get_gmm_prob(grid,means,cov,pi)
     num = pi[k0] * get_gaussian_prob(grid,means[k0],cov[k0])
     eps = 1e-15
     log_prob = th.log(num+eps) - th.log(prob+eps)
     return log_prob
 
-def get_hard_implicit_cls_field(grid,means,cov,pi,k0=0):
+def get_hard_icls_field(grid,means,cov,pi,k0=0):
 
     # -- compute log prob --
     grid = grid.clone().requires_grad_(True)
-    log_prob = get_implicit_cls_lprob(grid,means,cov,pi,k0)
+    log_prob = get_classifier_lprob(grid,means,cov,pi,k0)
 
     # -- backward --
     th.autograd.backward(log_prob,th.ones_like(log_prob))
     return grid.grad
 
-def get_soft_implicit_cls_field(grid,means,cov,pi,probs):
+def get_soft_icls_field(grid,means,cov,pi,probs):
 
     # -- compute log prob --
     grid = grid.clone().requires_grad_(True)
-    log_prob = probs[0]*get_implicit_cls_lprob(grid,means,cov,pi,0)
-    log_prob += probs[1]*get_implicit_cls_lprob(grid,means,cov,pi,1)
+    log_prob = 0
+    for k in range(len(means)):
+        log_prob += probs[k]*get_classifier_lprob(grid,means,cov,pi,k)
 
     # -- backward --
     th.autograd.backward(log_prob,th.ones_like(log_prob))
@@ -106,14 +107,16 @@ def main():
     #
     # -=-=-=-=-=-=-=-=-=-=-=-=-
 
-    means = th.tensor([[1.,1.0],
-                      [-1.,-1.0]])
-    cov = 1.5*th.tensor([
-        [[2.,0.],
-         [0.,2.]],
-        [[2.,0.],
-         [0.,2.]]])
-    pi = th.tensor([0.5,0.5])
+    K = 5
+    frac = 2*np.pi/K
+    theta = th.linspace(0,2*np.pi-frac,K)
+    means = th.stack([th.cos(theta),th.sin(theta)]).T
+    # K = 4
+    # # K = 5
+    # frac = 2*np.pi/K
+    # means = th.tensor([[1.,0],[-1.,0],[0.,1.],[0.,-1.]])
+    cov = th.eye(2)[None,:].repeat(K,1,1)
+    pi = th.ones(K)/K
 
     # -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
     #
@@ -121,14 +124,19 @@ def main():
     #
     # -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
-    nsamples,ulim,llim = 50,2,-2
+    nsamples,ulim,llim = 50,3,-3
     ns = nsamples
     gmm_grid = get_grid(nsamples,ulim,llim)
     gmm_probs = get_gmm_prob(gmm_grid,means,cov*.1,pi)
-    nsamples,ulim,llim = 20,2,0
-    grid = get_grid(nsamples,ulim,llim)
-    ihard_cls_field = get_hard_implicit_cls_field(grid,means,cov,pi,0)
-    isoft_cls_field = get_soft_implicit_cls_field(grid,means,cov,pi,[0.8,0.2])
+    cls_probs = th.zeros(len(means))
+    for k in range(len(means)):
+        cls_probs[k] = th.exp(get_classifier_lprob(means[[0]],means,cov,pi,k))
+    nsamples,ulim,llim = 20,3,0
+    ulim_y,llim_y = 1,-1
+    grid = get_grid(nsamples,ulim,llim,ulim_y,llim_y)
+    ihard_cls_field = get_hard_icls_field(grid,means,cov,pi,0)
+    print(cls_probs)
+    isoft_cls_field = get_soft_icls_field(grid,means,cov,pi,cls_probs)
     gt_cls_field = get_hard_cls_field(grid,means,cov,pi,0)
 
     # -- plot --
@@ -137,7 +145,7 @@ def main():
     fig,ax = plt.subplots(1,4,figsize=(12,3),gridspec_kw=ginfo)
     ax[0].pcolormesh(mshape(gmm_grid[:,0],ns),mshape(gmm_grid[:,1],ns),
                      mshape(gmm_probs,ns),shading='gouraud',cmap=plt.cm.Blues)
-    rect = patches.Rectangle((0.,0.), 1.98, 1.98, linewidth=2,
+    rect = patches.Rectangle((0.,-1.), 1.98, 1.98, linewidth=2,
                              edgecolor='r', facecolor='none')
     ax[0].add_patch(rect)
 

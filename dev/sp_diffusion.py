@@ -22,6 +22,7 @@ dcopy = copy.deepcopy
 from einops import rearrange,repeat
 from easydict import EasyDict as edict
 import torchvision.utils as tv_utils
+import torchvision.io as tv_io
 import torchvision.transforms.functional as TF
 from torchvision.transforms import InterpolationMode
 from pathlib import Path
@@ -35,9 +36,11 @@ from superpixel_diffusion.guidance import load_sp_model
 
 def inference(model,scheduler,state,sp_model,
               tgt_sims,tgt_ftrs,use_sp_guidance,rescale,use_ftrs,
-              update_target=False,use_deno_sp=False,use_closed_form=False):
+              update_target=False,use_deno_sp=False,num_sp_steps=5):
 
     eta = 1.
+    if use_sp_guidance is False:
+        num_sp_steps = 1
     info = edict()
     fields = ["sims_delta"]
     for k in fields: info[k] = []
@@ -48,9 +51,10 @@ def inference(model,scheduler,state,sp_model,
     for t in tqdm(scheduler.timesteps):
 
         # -- optionally enable grad --
-        with torch.set_grad_enabled(use_deno_sp):
-            if use_deno_sp:
-                state = state.requires_grad_(True)
+        # with torch.set_grad_enabled(use_deno_sp):
+        with torch.set_grad_enabled(False):
+            # if use_deno_sp:
+            #     state = state.requires_grad_(True)
             rescaled_score = model(state, t).sample
 
         # -- compute score --
@@ -61,7 +65,7 @@ def inference(model,scheduler,state,sp_model,
         sched_dict = scheduler.step(rescaled_score, t, state, **sched_kwargs)
         # next_state = sched_dict.prev_sample
         deno = sched_dict.pred_original_sample
-        deno = th.clip(deno,-1,1)
+        # deno = th.clip(deno,-1,1)
 
         # -- add guidance --
         # sp_scale = get_sp_ddim_scale_inference(scheduler,t,eta)
@@ -72,16 +76,49 @@ def inference(model,scheduler,state,sp_model,
         #       (state.min().item(),state.max().item()),
         #       ((tgt_ftrs).min().item(),(tgt_ftrs).max().item()))
         # exit()
-        if use_deno_sp:
-            sp_input,use_for_grad = deno,state
-        else:
-            sp_input = state.requires_grad_(True)
-            use_for_grad = sp_input
         alpha,beta,var,s_alpha = get_scales(scheduler,t)
-        sp_grad,sims_delta = superpixel_guidance(sp_input,sp_model,
-                                                 tgt_sims,tgt_ftrs,use_ftrs,
-                                                 use_for_grad=use_for_grad,
-                                                 use_closed_form=use_closed_form)
+        # if num_sp_steps > 1: assert (use_deno_sp is False)
+        # lr0 = 1e-2
+        # lr1 = 1e-1
+        lr = 5e-2
+        prev = None
+        # print("alpha,beta: ",alpha,beta)
+        eps = 1e-15
+        for s in range(num_sp_steps):
+            # sp_input = th.clamp(sp_input,-1,1)
+            if use_deno_sp:
+                sp_input,use_for_grad = deno,state
+            else:
+                # sp_input = state.requires_grad_(True)/(alpha+eps)
+                sp_input = state/(alpha+eps)
+                # sp_input = state
+                # print(sp_input.mean(),sp_input.max(),sp_input.min())
+                sp_input = th.clamp(sp_input,-1,1)
+                use_for_grad = sp_input
+            sp_grad,sims_delta = superpixel_guidance(sp_input,sp_model,
+                                                     tgt_sims,tgt_ftrs,use_ftrs,
+                                                     use_for_grad=use_for_grad)
+            # lr = lr0 if s < 10 else lr1
+            # if s == 0:
+            #     # sp_grad_acc = sp_grad.clone()
+            #     prev = sp_input.clone()
+            # if s > 0:
+            #     print("delta: ",th.mean((sp_input - prev)**2))
+            #     prev = sp_input.clone()
+            # if s > 0:
+            #     alpha = 0.75
+            #     sp_grad_acc = alpha * sp_grad +  (1-alpha) * sp_grad_acc
+            #     sp_grad = sp_grad_acc
+            if num_sp_steps > 1:
+                mask = th.rand_like(sp_grad) > 0.
+                # print(s,lr,sp_grad.abs().flatten(1).mean(-1))
+                state = (state.detach() + lr*mask*sp_grad)
+                # sp_input = (sp_input.detach() + lr*mask*sp_grad).clone().requires_grad_(True)
+                use_for_grad = sp_input
+                # print(sims_delta)
+            # if s > 3 and s < 7: print(sp_grad.abs().mean().item())
+            # print(sp_input[:,0,16,16])
+        # exit()
         # print("sp_input: ",sp_input.mean().item(),sp_input.min().item(),sp_input.max().item())
         #print("state: ",state.mean().item(),state.min().item(),state.max().item())
         # print("tgt_ftrs: ",tgt_ftrs.mean().item(),tgt_ftrs.min().item(),tgt_ftrs.max().item())
@@ -90,15 +127,15 @@ def inference(model,scheduler,state,sp_model,
         # print("rescaled_score: ",rescaled_score.abs().mean().item(),
         #       rescaled_score.abs().min().item(),rescaled_score.abs().max().item())
         if use_sp_guidance is False: sp_grad[...] = 0.
-        # print("grad: ",sp_grad.abs().mean().item(),
-        #       sp_grad.abs().min().item(),sp_grad.abs().max().item(),use_sp_guidance)
+        # print("grad: ",sp_grad.mean().item(),
+        #       sp_grad.min().item(),sp_grad.max().item(),use_sp_guidance)
         # sims_delta = th.ones((len(deno)),device=deno.device).tolist()
         # sp_grad = th.zeros_like(score)
 
         #-- update --
         # rescale_score is negative of score function.
         # sp_scale = 1.
-        alpha,beta,var,s_alpha = get_scales(scheduler,t)
+        # alpha,beta,var,s_alpha = get_scales(scheduler,t)
         rescaled_score = rescaled_score + rescale * (-beta) * sp_grad
         # rescaled_score = rescaled_score - rescale * sp_grad
         # print(sp_scale)
@@ -109,10 +146,11 @@ def inference(model,scheduler,state,sp_model,
         # -- update target --
         if update_target:
             _deno = deno.detach()
-            tgt_sims,_,_,tgt_ftrs = sp_model(_deno)
+            _,_,_,tgt_ftrs,tgt_sims = sp_model(_deno)
 
         # -- update info --
         info.sims_delta.append(sims_delta)
+    print(state.flatten(1).mean(-1))
 
     return state,info
 
@@ -136,7 +174,7 @@ def get_scales(scheduler,t):
     return alpha_prod_t ** (0.5),beta_prod_t ** (0.5),var,s_alpha
 
 
-def save_image(name,input,proc=True,with_grid=True):
+def save_image(name,input,proc=True,with_grid=True,with_images=True):
     # -- create output dir --
     if not Path(name).exists():
         Path(name).mkdir(parents=True)
@@ -151,7 +189,8 @@ def save_image(name,input,proc=True,with_grid=True):
         image = input[b]
         image = (image.permute(1, 2, 0) * 255).round().to(torch.uint8).cpu().numpy()
         image = Image.fromarray(image)
-        image.save("%s/%05d.png" % (name,b))
+        if with_images:
+            image.save("%s/%05d.png" % (name,b))
 
     # -- save a grid --
     if with_grid:
@@ -251,9 +290,10 @@ def get_tgt_sp(ddpm_name,sp_model,B,H,W):
         imgs = get_tgt_sp_flowers(sp_model,B,H,W)
     else:
         raise ValueError(f"Uknown data name [{ddpm_name}]")
+    # print("pre: ",imgs.min().item(),imgs.max().item())
     imgs = 2.*imgs-1.
     # print(imgs.min().item(),imgs.max().item())
-    sims,_,_,ftrs = sp_model(imgs)
+    _,_,_,ftrs,sims = sp_model(imgs)
     return imgs,sims,ftrs
 
 def load_model(model_config_name_or_path,chkpt_path,nsteps,res):
@@ -298,8 +338,7 @@ def load_model(model_config_name_or_path,chkpt_path,nsteps,res):
 
 def extract_defaults(cfg):
     cfg = dcopy(cfg)
-    pairs = {"model_chkpt":None,"update_target":False,"use_deno_sp":False,
-             "use_closed_form":False}
+    pairs = {"model_chkpt":None,"update_target":False,"use_deno_sp":False}
     for key in pairs:
         if key in cfg: continue
         cfg[key] = pairs[key]
@@ -357,12 +396,17 @@ def run_exp(cfg,sp_img=None):
     if sp_img is None:
         sp_img,tgt_sims,tgt_ftrs = get_tgt_sp(sp_source,sp_model,cfg.B,H,W)
     else:
-        tgt_sims,_,_,tgt_ftrs = sp_model(sp_img)
+        _,_,_,tgt_ftrs,tgt_sims = sp_model(sp_img)
+    # print(tgt_ftrs.shape)
+    # print(tgt_ftrs[0,:,256//8*128//8+128//8])
     # print("sp_img.min(),sp_img.max(): ",sp_img.min(),sp_img.max())
     # exit()
-    save_image("sp_img",sp_img)
+    save_image("sp_img",sp_img,with_images=False)
     if tgt_sims.shape[0] == 1:
-        tgt_sims = repeat(tgt_sims,'1 h w sh sw -> b h w sh sw',b=B)
+        # tgt_sims = repeat(tgt_sims,'1 h w sh sw -> b h w sh sw',b=cfg.B)
+        # tgt_sims = repeat(tgt_sims,'1 nine (h w) -> b h w nine',b=cfg.B,h=H,w=W)
+        tgt_sims = repeat(tgt_sims,'1 nine hw -> b nine hw',b=cfg.B)
+        tgt_ftrs = repeat(tgt_ftrs,'1 f shsw -> b f shsw',b=cfg.B)
 
     # -- some thinking --
     # state = sp_img
@@ -374,11 +418,9 @@ def run_exp(cfg,sp_img=None):
     # exit()
 
     # -- inference --
-    sample,info = inference(model,scheduler,noise,sp_model,
-                            tgt_sims,tgt_ftrs,
+    sample,info = inference(model,scheduler,noise,sp_model,tgt_sims,tgt_ftrs,
                             cfg.use_sp_guidance,cfg.rescale,cfg.use_ftrs,
-                            cfg.update_target,cfg.use_deno_sp,
-                            cfg.use_closed_form)
+                            cfg.update_target,cfg.use_deno_sp,cfg.num_sp_steps)
 
     # -- viz delta superpixel sims --
     format_info(info)
@@ -390,12 +432,20 @@ def run_exp(cfg,sp_img=None):
     if not save_root_i.exists(): save_root_i.mkdir(parents=True)
     print(save_root_i)
     save_image(save_root_i,sample,with_grid=False)
+    # rz_sp_img = save_resized(sp_img,H,W,3)
+    # print("delta: ",th.mean((rz_sp_img - sample)**2).item())
 
     # -- save grid --
     save_root_g = save_root/"grid"
     if not save_root_g.exists(): save_root_g.mkdir(parents=True)
     grid = (tv_utils.make_grid(sample)[None,:] + 1)/2.
     tv_utils.save_image(grid,save_root_g/"grid.png")
+
+    # -- info --
+    # print(tgt_ftrs[0,:,256//2*128//2+128//2])
+    # print(sp_img[0,:,128,128])
+    # print(sample[0,:,128,128])
+
     return sample
 
 def search_images(stnd,sp_model,use_ftrs,sp_source,
@@ -412,14 +462,17 @@ def search_images(stnd,sp_model,use_ftrs,sp_source,
         return img
 
     # -- compute reference --
-    tgt_sims,_,_,tgt_ftrs = sp_model(stnd)
+    _,_,_,tgt_ftrs,tgt_sims = sp_model(stnd)
 
     # -- init --
     device = stnd.device
     root = name_to_path(sp_source)
+    print(f"Searching from {str(root)}")
     flip_colors= "cifar10" in sp_source
     fns = [fn for fn in root.iterdir() if fn.suffix in [".jpg",".png"]]
     idx_list = np.random.permutation(len(fns))
+    max_num = min(max_num,len(idx_list))
+    print(max_num,idx_list)
     if max_num > 0: idx_list = idx_list[:max_num]
     nochange = 0
     index = -1
@@ -432,7 +485,7 @@ def search_images(stnd,sp_model,use_ftrs,sp_source,
         img = read_fn(fns[idx],flip_colors,device)
 
         # -- compute sp --
-        prop_sims,_,_,prop_ftrs = sp_model(img)
+        _,_,_,prop_ftrs,prop_sims = sp_model(img)
 
         # -- compute dists --
         # dists = (stnd - img).flatten(1).pow(2).mean(-1)
@@ -467,6 +520,12 @@ def format_info(info):
     delta = np.exp(-10*delta)
     print(delta)
 
+def save_resized(img,H,W,S):
+    img = TF.resize(img,(H//S,W//S),InterpolationMode.BILINEAR)
+    img = TF.resize(img,(H,W),InterpolationMode.BILINEAR)
+    save_image("resized",img,with_images=True,with_grid=False)
+    return img
+
 def run_batched_exp(cfg,num):
     print(f"Running {cfg.exp_name}")
     for i in range(num):
@@ -474,6 +533,22 @@ def run_batched_exp(cfg,num):
         cfg_i.exp_name = cfg.exp_name + "_%02d" % i
         cfg_i.seed = cfg.seed + i
         run_exp(cfg_i)
+
+def load_searched_images(root,B,device):
+    imgs = []
+    for b in range(B):
+        img_b = tv_io.read_image(str(Path(root)/("%05d.png"%b)))
+        imgs.append(img_b/255.)
+    imgs = th.stack(imgs)
+    imgs = 2*imgs.to(device)-1
+    return imgs
+
+def save_searched_images(root,imgs):
+    if not Path(root).exists():
+        Path(root).mkdir(parents=True)
+    imgs = (imgs+1)/2.
+    for b in range(len(imgs)):
+        tv_utils.save_image(imgs[b],Path(root)/("%05d.png"%b))
 
 def run_batched_celebhq():
     # -- config --
@@ -565,22 +640,45 @@ def main():
     cfg = edict()
     # cfg.seed = 456
     # cfg.seed = 567
-    cfg.seed = 567+1
-    cfg.B = 8
+    # cfg.seed = 567+1
+    cfg.seed = 567+4
+    cfg.B = 1
     cfg.nsteps = 100
     cfg.use_sp_guidance = True
     # cfg.ddpm_sched_name = "google/ddpm-cat-256"
-    # cfg.ddpm_sched_name = "google/ddpm-celebahq-256"
-    cfg.ddpm_sched_name = "google/ddpm-cifar10-32"
-    cfg.stride = 8
-    cfg.scale = .5
-    cfg.M = 0
-    cfg.rescale = 1.
-    cfg.use_deno_sp = False
-    cfg.use_closed_form = True
-    cfg.use_ftrs = False
-    cfg.update_target = False
+    cfg.ddpm_sched_name = "google/ddpm-celebahq-256"
+    # cfg.ddpm_sched_name = "google/ddpm-cifar10-32"
+    cfg.num_sp_steps = 1
+    # cfg.stride = 12
+    # cfg.scale = .25
+
+    # cfg.stride = 16
+    # cfg.scale = .5
+    # cfg.scale = .3
+    # cfg.rescale = 1.
+    # cfg.use_ftrs = True
+    # cfg.use_deno_sp = True
+
+    cfg.M = 0.
+    cfg.stride = 16
+    # -- works for celeb --
+    cfg.use_ftrs = True
+    cfg.use_deno_sp = True
+    # cfg.scale = .1
+    cfg.scale = 1.
+    cfg.rescale = .25
     cfg.sp_niters = 10
+
+    # -- a comparison --
+    # cfg.M = 50.
+    # cfg.stride = 2
+    # cfg.use_ftrs = True
+    # cfg.use_deno_sp = True
+    # cfg.scale = 1.
+    # cfg.rescale = .0025
+    # cfg.sp_niters = 2
+
+    cfg.update_target = False
     cfg.model_name = None
     # nsteps = 25500
     cfg.model_name = cfg.ddpm_sched_name
@@ -598,9 +696,9 @@ def main():
     # cfg.sp_source = "flowers"
     # cfg.model_name = None
 
-    cfg.sp_source = "cifar10"
-    # cfg.sp_source = "celeb"
-    cfg.tag = "v0"
+    # cfg.sp_source = "cifar10"
+    cfg.sp_source = "celeb"
+    cfg.tag = "v1"
 
     # -- standard --
     cfg.exp_name = "stand_dev"
@@ -612,10 +710,18 @@ def main():
     # cfg.model_chkpt = "ddpm-ema-flowers-64-sp/checkpoint-%d/unet" % nsteps
     # stnd = run_exp(cfg)
 
-    # sp_model = load_sp_model("gensp",cfg.stride,cfg.scale,cfg.M,cfg.sp_niters)
-    # use_ftrs = False
-    # srch = search_images(stnd,sp_model,use_ftrs,cfg.sp_source,max_num=10000)
-    srch = None
+    # -- searching --
+    use_ftrs = False
+    sp_model = load_sp_model("gensp",cfg.stride,cfg.scale,cfg.M,cfg.sp_niters)
+    # srch = search_images(stnd,sp_model,use_ftrs,cfg.sp_source,max_num=1e5)
+    # srch = None
+
+    # -- read searching --
+    root = "searched"
+    # save_searched_images(root,srch)
+    srch = load_searched_images(root,cfg.B,"cuda")
+    # print(th.mean((srch-_srch)**2))
+    # exit()
 
     # -- conditional --
     cfg.exp_name = "cond_dev"
